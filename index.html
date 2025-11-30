@@ -180,7 +180,8 @@
           const hasSplits = d.splits?.length > 0;
           const totalFiles = 1 + (d.splits?.length || 0);
 
-          let html = '<div class="msg ok"><strong>' + d.title + '</strong><br>Version: ' + d.version + '<br>Size: ' + d.size;
+          const archLabel = arch === 'arm64-v8a' ? 'ARM64' : 'ARMv7';
+          let html = '<div class="msg ok"><strong>' + d.title + '</strong><br>Version: ' + d.version + ' | ' + archLabel + '<br>Size: ' + d.size;
           html += '<br><small>Found working token after ' + d.attempt + ' attempts</small>';
           if (hasSplits) {
             html += '<br><strong>' + totalFiles + ' APK files</strong> (1 base + ' + d.splits.length + ' splits)';
