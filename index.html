@@ -193,7 +193,7 @@
           html += '</div><div class="app-actions">';
 
           if (hasSplits && shouldMerge) {
-            html += '<button onclick="downloadMerged(\'' + pkg + '\', \'' + arch + '\')">Download Merged APK</button>';
+            html += '<button onclick="downloadMerged(\'' + pkg + '\')">Download Merged APK</button>';
           } else if (hasSplits) {
             html += '<button onclick="downloadAll()">Download ZIP</button>';
           } else {
@@ -213,7 +213,8 @@
       };
     }
 
-    function downloadMerged(pkg, arch) {
+    function downloadMerged(pkg) {
+      const arch = $('#arch-select').value;
       const progressEl = $('#download-progress');
       progressEl.innerHTML = '<div class="msg info"><span class="spin"></span>Starting merge process...</div>';
 

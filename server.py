@@ -43,7 +43,8 @@ DETAILS_URL = f'{FDFE_URL}/details'
 from pathlib import Path
 AUTH_CACHE_FILE = Path.home() / '.gplay-auth.json'
 
-DEFAULT_DEVICE = {
+# Device profile for ARM64 (modern 64-bit phones)
+DEVICE_ARM64 = {
     'UserReadableName': 'Google Pixel 7a',
     'Build.HARDWARE': 'lynx',
     'Build.RADIO': 'unknown',
@@ -82,15 +83,57 @@ DEFAULT_DEVICE = {
     'SimOperator': '38',
 }
 
+# Device profile for ARMv7 (older 32-bit phones) - Samsung Galaxy J7
+DEVICE_ARMV7 = {
+    'UserReadableName': 'Samsung Galaxy J7',
+    'Build.HARDWARE': 'samsungexynos7870',
+    'Build.RADIO': 'unknown',
+    'Build.FINGERPRINT': 'samsung/j7xeltexx/j7xelte:8.1.0/M1AJQ/J710FXXU6CSH1:user/release-keys',
+    'Build.BRAND': 'samsung',
+    'Build.DEVICE': 'j7xelte',
+    'Build.VERSION.SDK_INT': '27',
+    'Build.VERSION.RELEASE': '8.1.0',
+    'Build.MODEL': 'SM-J710F',
+    'Build.MANUFACTURER': 'samsung',
+    'Build.PRODUCT': 'j7xeltexx',
+    'Build.ID': 'M1AJQ',
+    'Build.BOOTLOADER': 'J710FXXU6CSH1',
+    'TouchScreen': '3',
+    'Keyboard': '1',
+    'Navigation': '1',
+    'ScreenLayout': '2',
+    'HasHardKeyboard': 'false',
+    'HasFiveWayNavigation': 'false',
+    'Screen.Density': '320',
+    'Screen.Width': '720',
+    'Screen.Height': '1280',
+    'Platforms': 'armeabi-v7a,armeabi',
+    'Features': 'android.hardware.sensor.proximity,android.hardware.touchscreen,android.hardware.wifi,android.hardware.camera,android.hardware.bluetooth',
+    'Locales': 'en_US,en_GB',
+    'SharedLibraries': 'android.ext.shared,org.apache.http.legacy',
+    'GL.Version': '196609',
+    'GL.Extensions': 'GL_OES_EGL_image',
+    'Client': 'android-google',
+    'GSF.version': '203615037',
+    'Vending.version': '82041300',
+    'Vending.versionString': '20.4.13-all [0] [PR] 312295870',
+    'Roaming': 'mobile-notroaming',
+    'TimeZone': 'America/New_York',
+    'CellOperator': '310',
+    'SimOperator': '38',
+}
+
+# Default for backward compatibility
+DEFAULT_DEVICE = DEVICE_ARM64
+
 SUPPORTED_ARCHS = ['arm64-v8a', 'armeabi-v7a']
 
 
 def get_device_config(arch='arm64-v8a'):
     """Get device config for a specific architecture."""
-    config = DEFAULT_DEVICE.copy()
-    if arch in SUPPORTED_ARCHS:
-        config['Platforms'] = arch
-    return config
+    if arch == 'armeabi-v7a':
+        return DEVICE_ARMV7.copy()
+    return DEVICE_ARM64.copy()
 
 
 def merge_apks(base_apk_bytes, split_apks_bytes_list):
@@ -762,36 +805,38 @@ def download_info_stream(pkg):
     def generate():
         attempt = 0
 
-        # First try cached token
-        cached = get_cached_auth()
-        if cached:
-            yield f"data: {json.dumps({'type': 'progress', 'attempt': 0, 'message': 'Trying cached token...'})}\n\n"
-            try:
-                info = get_download_info(pkg, cached)
-                if 'error' not in info:
-                    logger.info(f"Cached token worked for {pkg}")
-                    result = {
-                        'type': 'success',
-                        'attempt': 0,
-                        'filename': info['filename'],
-                        'title': info['title'],
-                        'version': info['versionString'],
-                        'versionCode': info['versionCode'],
-                        'size': format_size(info['downloadSize']),
-                        'downloadUrl': info['downloadUrl'],
-                        'cookies': info['cookies'],
-                        'splits': [{
-                            'filename': f"{pkg}-{info['versionCode']}-{s['name']}.apk",
-                            'name': s['name'],
-                            'downloadUrl': s['downloadUrl']
-                        } for s in info['splits']]
-                    }
-                    yield f"data: {json.dumps(result)}\n\n"
-                    return
-                else:
-                    yield f"data: {json.dumps({'type': 'progress', 'attempt': 0, 'message': 'Cached token failed, trying new tokens...'})}\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'type': 'progress', 'attempt': 0, 'message': f'Cached token error: {str(e)[:30]}'})}\n\n"
+        # Only use cached token for default architecture (arm64-v8a)
+        # Cached tokens are tied to the device config they were created with
+        if arch == 'arm64-v8a':
+            cached = get_cached_auth()
+            if cached:
+                yield f"data: {json.dumps({'type': 'progress', 'attempt': 0, 'message': 'Trying cached token...'})}\n\n"
+                try:
+                    info = get_download_info(pkg, cached)
+                    if 'error' not in info:
+                        logger.info(f"Cached token worked for {pkg}")
+                        result = {
+                            'type': 'success',
+                            'attempt': 0,
+                            'filename': info['filename'],
+                            'title': info['title'],
+                            'version': info['versionString'],
+                            'versionCode': info['versionCode'],
+                            'size': format_size(info['downloadSize']),
+                            'downloadUrl': info['downloadUrl'],
+                            'cookies': info['cookies'],
+                            'splits': [{
+                                'filename': f"{pkg}-{info['versionCode']}-{s['name']}.apk",
+                                'name': s['name'],
+                                'downloadUrl': s['downloadUrl']
+                            } for s in info['splits']]
+                        }
+                        yield f"data: {json.dumps(result)}\n\n"
+                        return
+                    else:
+                        yield f"data: {json.dumps({'type': 'progress', 'attempt': 0, 'message': 'Cached token failed, trying new tokens...'})}\n\n"
+                except Exception as e:
+                    yield f"data: {json.dumps({'type': 'progress', 'attempt': 0, 'message': f'Cached token error: {str(e)[:30]}'})}\n\n"
 
         while True:
             attempt += 1
@@ -935,14 +980,17 @@ def download_merged_stream(pkg):
         auth_data = None
         info = None
 
-        cached = get_cached_auth()
-        if cached:
-            try:
-                info = get_download_info(pkg, cached)
-                if 'error' not in info:
-                    auth_data = cached
-            except:
-                pass
+        # Only use cached token for default architecture (arm64-v8a)
+        # Cached tokens are tied to the device config they were created with
+        if arch == 'arm64-v8a':
+            cached = get_cached_auth()
+            if cached:
+                try:
+                    info = get_download_info(pkg, cached)
+                    if 'error' not in info:
+                        auth_data = cached
+                except:
+                    pass
 
         if not auth_data:
             for attempt in range(50):
@@ -1079,17 +1127,19 @@ def download_merged(pkg):
     auth_data = None
     info = None
 
-    # First try cached token
-    cached = get_cached_auth()
-    if cached:
-        try:
-            info = get_download_info(pkg, cached)
-            if 'error' not in info:
-                auth_data = cached
-        except:
-            pass
+    # Only use cached token for default architecture (arm64-v8a)
+    # Cached tokens are tied to the device config they were created with
+    if arch == 'arm64-v8a':
+        cached = get_cached_auth()
+        if cached:
+            try:
+                info = get_download_info(pkg, cached)
+                if 'error' not in info:
+                    auth_data = cached
+            except:
+                pass
 
-    # If cached didn't work, try new tokens
+    # If cached didn't work or wrong arch, try new tokens
     if not auth_data:
         for attempt in range(100):  # Limit attempts for non-streaming endpoint
             try:
