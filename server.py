@@ -39,9 +39,13 @@ PURCHASE_URL = f'{FDFE_URL}/purchase'
 DELIVERY_URL = f'{FDFE_URL}/delivery'
 DETAILS_URL = f'{FDFE_URL}/details'
 
-# Server-side auth cache file (shared with CLI)
+# Server-side auth cache files (per architecture)
 from pathlib import Path
-AUTH_CACHE_FILE = Path.home() / '.gplay-auth.json'
+AUTH_CACHE_DIR = Path.home()
+AUTH_CACHE_FILES = {
+    'arm64-v8a': AUTH_CACHE_DIR / '.gplay-auth.json',  # Default for backward compat
+    'armeabi-v7a': AUTH_CACHE_DIR / '.gplay-auth-armv7.json',
+}
 
 # Device profile for ARM64 (modern 64-bit phones)
 DEVICE_ARM64 = {
@@ -328,25 +332,27 @@ def format_size(bytes_size):
     return f'{size:.2f} {units[i]}'
 
 
-def get_cached_auth():
-    """Load cached auth from server-side auth file if available."""
-    if AUTH_CACHE_FILE.exists():
+def get_cached_auth(arch='arm64-v8a'):
+    """Load cached auth from server-side auth file for specific architecture."""
+    cache_file = AUTH_CACHE_FILES.get(arch, AUTH_CACHE_FILES['arm64-v8a'])
+    if cache_file.exists():
         try:
-            with open(AUTH_CACHE_FILE) as f:
+            with open(cache_file) as f:
                 auth = json.load(f)
             if auth.get('authToken') and auth.get('gsfId'):
-                logger.info("Using cached auth token")
+                logger.info(f"Using cached auth token for {arch}")
                 return auth
         except Exception as e:
-            logger.warning(f"Failed to load cached auth: {e}")
+            logger.warning(f"Failed to load cached auth for {arch}: {e}")
     return None
 
 
-def save_cached_auth(auth_data):
-    """Save auth data to server-side cache file."""
+def save_cached_auth(auth_data, arch='arm64-v8a'):
+    """Save auth data to server-side cache file for specific architecture."""
+    cache_file = AUTH_CACHE_FILES.get(arch, AUTH_CACHE_FILES['arm64-v8a'])
     try:
-        AUTH_CACHE_FILE.write_text(json.dumps(auth_data, indent=2))
-        logger.info(f"Auth saved to: {AUTH_CACHE_FILE}")
+        cache_file.write_text(json.dumps(auth_data, indent=2))
+        logger.info(f"Auth saved to: {cache_file}")
         return True
     except Exception as e:
         logger.error(f"Failed to save auth: {e}")
@@ -805,38 +811,36 @@ def download_info_stream(pkg):
     def generate():
         attempt = 0
 
-        # Only use cached token for default architecture (arm64-v8a)
-        # Cached tokens are tied to the device config they were created with
-        if arch == 'arm64-v8a':
-            cached = get_cached_auth()
-            if cached:
-                yield f"data: {json.dumps({'type': 'progress', 'attempt': 0, 'message': 'Trying cached token...'})}\n\n"
-                try:
-                    info = get_download_info(pkg, cached)
-                    if 'error' not in info:
-                        logger.info(f"Cached token worked for {pkg}")
-                        result = {
-                            'type': 'success',
-                            'attempt': 0,
-                            'filename': info['filename'],
-                            'title': info['title'],
-                            'version': info['versionString'],
-                            'versionCode': info['versionCode'],
-                            'size': format_size(info['downloadSize']),
-                            'downloadUrl': info['downloadUrl'],
-                            'cookies': info['cookies'],
-                            'splits': [{
-                                'filename': f"{pkg}-{info['versionCode']}-{s['name']}.apk",
-                                'name': s['name'],
-                                'downloadUrl': s['downloadUrl']
-                            } for s in info['splits']]
-                        }
-                        yield f"data: {json.dumps(result)}\n\n"
-                        return
-                    else:
-                        yield f"data: {json.dumps({'type': 'progress', 'attempt': 0, 'message': 'Cached token failed, trying new tokens...'})}\n\n"
-                except Exception as e:
-                    yield f"data: {json.dumps({'type': 'progress', 'attempt': 0, 'message': f'Cached token error: {str(e)[:30]}'})}\n\n"
+        # Try cached token for this architecture
+        cached = get_cached_auth(arch)
+        if cached:
+            yield f"data: {json.dumps({'type': 'progress', 'attempt': 0, 'message': 'Trying cached token...'})}\n\n"
+            try:
+                info = get_download_info(pkg, cached)
+                if 'error' not in info:
+                    logger.info(f"Cached token worked for {pkg}")
+                    result = {
+                        'type': 'success',
+                        'attempt': 0,
+                        'filename': info['filename'],
+                        'title': info['title'],
+                        'version': info['versionString'],
+                        'versionCode': info['versionCode'],
+                        'size': format_size(info['downloadSize']),
+                        'downloadUrl': info['downloadUrl'],
+                        'cookies': info['cookies'],
+                        'splits': [{
+                            'filename': f"{pkg}-{info['versionCode']}-{s['name']}.apk",
+                            'name': s['name'],
+                            'downloadUrl': s['downloadUrl']
+                        } for s in info['splits']]
+                    }
+                    yield f"data: {json.dumps(result)}\n\n"
+                    return
+                else:
+                    yield f"data: {json.dumps({'type': 'progress', 'attempt': 0, 'message': 'Cached token failed, trying new tokens...'})}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'progress', 'attempt': 0, 'message': f'Cached token error: {str(e)[:30]}'})}\n\n"
 
         while True:
             attempt += 1
@@ -876,8 +880,8 @@ def download_info_stream(pkg):
                     time.sleep(0.5)
                     continue
 
-                # Success! Save the working token and return info
-                save_cached_auth(auth_data)
+                # Success! Save the working token for this arch and return info
+                save_cached_auth(auth_data, arch)
                 logger.info(f"Token #{attempt} worked for {pkg}")
 
                 result = {
@@ -980,17 +984,15 @@ def download_merged_stream(pkg):
         auth_data = None
         info = None
 
-        # Only use cached token for default architecture (arm64-v8a)
-        # Cached tokens are tied to the device config they were created with
-        if arch == 'arm64-v8a':
-            cached = get_cached_auth()
-            if cached:
-                try:
-                    info = get_download_info(pkg, cached)
-                    if 'error' not in info:
-                        auth_data = cached
-                except:
-                    pass
+        # Try cached token for this architecture
+        cached = get_cached_auth(arch)
+        if cached:
+            try:
+                info = get_download_info(pkg, cached)
+                if 'error' not in info:
+                    auth_data = cached
+            except:
+                pass
 
         if not auth_data:
             for attempt in range(50):
@@ -1015,7 +1017,7 @@ def download_merged_stream(pkg):
                     info = get_download_info(pkg, auth_data)
 
                     if 'error' not in info:
-                        save_cached_auth(auth_data)
+                        save_cached_auth(auth_data, arch)
                         break
                     else:
                         auth_data = None
@@ -1127,19 +1129,17 @@ def download_merged(pkg):
     auth_data = None
     info = None
 
-    # Only use cached token for default architecture (arm64-v8a)
-    # Cached tokens are tied to the device config they were created with
-    if arch == 'arm64-v8a':
-        cached = get_cached_auth()
-        if cached:
-            try:
-                info = get_download_info(pkg, cached)
-                if 'error' not in info:
-                    auth_data = cached
-            except:
-                pass
+    # Try cached token for this architecture
+    cached = get_cached_auth(arch)
+    if cached:
+        try:
+            info = get_download_info(pkg, cached)
+            if 'error' not in info:
+                auth_data = cached
+        except:
+            pass
 
-    # If cached didn't work or wrong arch, try new tokens
+    # If cached didn't work, try new tokens
     if not auth_data:
         for attempt in range(100):  # Limit attempts for non-streaming endpoint
             try:
@@ -1162,7 +1162,7 @@ def download_merged(pkg):
                 info = get_download_info(pkg, auth_data)
 
                 if 'error' not in info:
-                    save_cached_auth(auth_data)
+                    save_cached_auth(auth_data, arch)
                     break
                 else:
                     auth_data = None

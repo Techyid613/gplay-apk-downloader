@@ -95,6 +95,14 @@
   <script>
     const $ = s => document.querySelector(s);
 
+    // Clear download info when architecture changes
+    document.addEventListener('DOMContentLoaded', () => {
+      $('#arch-select').addEventListener('change', () => {
+        $('#info-result').innerHTML = '';
+        currentDownloadInfo = null;
+      });
+    });
+
     async function search() {
       const q = $('#search-q').value.trim();
       if (!q) return;
