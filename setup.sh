@@ -127,6 +127,7 @@ cd "$SCRIPT_DIR"
 
 echo "Starting server in background..."
 nohup python3 server.py > server.log 2>&1 &
+disown
 echo "Server started (PID: $!)"
 echo "Logs: tail -f $SCRIPT_DIR/server.log"
 EOF
