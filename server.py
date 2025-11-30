@@ -18,6 +18,9 @@ from flask_cors import CORS
 import requests
 import cloudscraper
 
+# Reusable scraper instance (faster than creating new one each time)
+SCRAPER = cloudscraper.create_scraper()
+
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -651,10 +654,9 @@ def search():
         return jsonify({'error': 'Query required'}), 400
 
     try:
-        scraper = cloudscraper.create_scraper()
-        response = scraper.get(
+        response = SCRAPER.get(
             f'https://play.google.com/store/search?q={query}&c=apps',
-            timeout=30
+            timeout=10
         )
         html = response.text
 
