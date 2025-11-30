@@ -96,9 +96,13 @@
   <script>
     const $ = s => document.querySelector(s);
 
-    // Clear download info when architecture changes
+    // Clear download info and stop any ongoing download when architecture changes
     document.addEventListener('DOMContentLoaded', () => {
       $('#arch-select').addEventListener('change', () => {
+        if (downloadEventSource) {
+          downloadEventSource.close();
+          downloadEventSource = null;
+        }
         $('#info-result').innerHTML = '';
         currentDownloadInfo = null;
       });
@@ -156,6 +160,12 @@
     }
 
     async function dl(pkg) {
+      // Close any existing download before starting a new one
+      if (downloadEventSource) {
+        downloadEventSource.close();
+        downloadEventSource = null;
+      }
+
       const el = $('#info-result');
       const arch = $('#arch-select').value;
       const shouldMerge = $('#merge-apks').checked;
