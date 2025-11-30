@@ -96,15 +96,29 @@
   <script>
     const $ = s => document.querySelector(s);
 
+    // Global state - track ALL EventSources
+    let downloadEventSource = null;
+    let mergeEventSource = null;
+    let currentDownloadInfo = null;
+
+    // Clear ALL download state
+    function clearDownloadState() {
+      if (downloadEventSource) {
+        downloadEventSource.close();
+        downloadEventSource = null;
+      }
+      if (mergeEventSource) {
+        mergeEventSource.close();
+        mergeEventSource = null;
+      }
+      currentDownloadInfo = null;
+    }
+
     // Clear download info and stop any ongoing download when architecture changes
     document.addEventListener('DOMContentLoaded', () => {
       $('#arch-select').addEventListener('change', () => {
-        if (downloadEventSource) {
-          downloadEventSource.close();
-          downloadEventSource = null;
-        }
+        clearDownloadState();
         $('#info-result').innerHTML = '';
-        currentDownloadInfo = null;
       });
     });
 
@@ -146,25 +160,15 @@
       dl(pkg);
     }
 
-    // Store current download info for Download All
-    let currentDownloadInfo = null;
-
-    let downloadEventSource = null;
-
     function stopDownload() {
-      if (downloadEventSource) {
-        downloadEventSource.close();
-        downloadEventSource = null;
-      }
+      clearDownloadState();
       $('#info-result').innerHTML = '<div class="msg info">Download cancelled</div>';
     }
 
     async function dl(pkg) {
-      // Close any existing download before starting a new one
-      if (downloadEventSource) {
-        downloadEventSource.close();
-        downloadEventSource = null;
-      }
+      // Clear ALL state before starting a new download
+      clearDownloadState();
+      $('#info-result').innerHTML = '';
 
       const el = $('#info-result');
       const arch = $('#arch-select').value;
@@ -172,8 +176,9 @@
 
       el.innerHTML = '<div class="loading"><span class="spin"></span>Preparing...<br><button class="sec" onclick="stopDownload()" style="margin-top:10px">Stop</button></div>';
 
-      // Use streaming endpoint that tries unlimited tokens, with arch parameter
-      downloadEventSource = new EventSource('/api/download-info-stream/' + encodeURIComponent(pkg) + '?arch=' + arch);
+      // Use streaming endpoint that tries unlimited tokens, with arch parameter and cache buster
+      const cacheBuster = Date.now();
+      downloadEventSource = new EventSource('/api/download-info-stream/' + encodeURIComponent(pkg) + '?arch=' + arch + '&_=' + cacheBuster);
 
       downloadEventSource.onmessage = function(event) {
         const d = JSON.parse(event.data);
@@ -234,13 +239,20 @@
     }
 
     function downloadMerged(pkg) {
+      // Close any existing merge EventSource
+      if (mergeEventSource) {
+        mergeEventSource.close();
+        mergeEventSource = null;
+      }
+
       const arch = $('#arch-select').value;
       const progressEl = $('#download-progress');
       progressEl.innerHTML = '<div class="msg info"><span class="spin"></span>Starting merge process...</div>';
 
-      const es = new EventSource('/api/download-merged-stream/' + encodeURIComponent(pkg) + '?arch=' + arch);
+      const cacheBuster = Date.now();
+      mergeEventSource = new EventSource('/api/download-merged-stream/' + encodeURIComponent(pkg) + '?arch=' + arch + '&_=' + cacheBuster);
 
-      es.onmessage = function(event) {
+      mergeEventSource.onmessage = function(event) {
         const d = JSON.parse(event.data);
 
         if (d.type === 'progress') {
@@ -250,7 +262,8 @@
           }
           progressEl.innerHTML = '<div class="msg info"><span class="spin"></span>' + d.message + pct + '</div>';
         } else if (d.type === 'success') {
-          es.close();
+          mergeEventSource.close();
+          mergeEventSource = null;
           if (d.original) {
             progressEl.innerHTML = '<div class="msg ok">Download complete! (original signature preserved)</div>';
           } else {
@@ -259,13 +272,15 @@
           // Trigger download
           window.location.href = '/api/download-temp/' + d.download_id;
         } else if (d.type === 'error') {
-          es.close();
+          mergeEventSource.close();
+          mergeEventSource = null;
           progressEl.innerHTML = '<div class="msg err">Error: ' + d.message + '</div>';
         }
       };
 
-      es.onerror = function() {
-        es.close();
+      mergeEventSource.onerror = function() {
+        mergeEventSource.close();
+        mergeEventSource = null;
         progressEl.innerHTML = '<div class="msg err">Connection error. Please try again.</div>';
       };
     }
