@@ -685,7 +685,6 @@ def auth_stream():
             return
 
         attempt = 0
-        scraper = get_scraper()  # Reuse scraper across attempts
         while True:
             # Check timeout
             if time.time() - start_time > SSE_MAX_DURATION:
@@ -698,6 +697,7 @@ def auth_stream():
             yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Trying token #{attempt}...'})}\n\n"
 
             try:
+                scraper = cloudscraper.create_scraper()  # Fresh scraper each attempt
                 response = scraper.post(
                     DISPENSER_URL,
                     headers={
@@ -968,7 +968,6 @@ def download_info_stream(pkg):
             except Exception as e:
                 yield f"data: {json.dumps({'type': 'progress', 'attempt': 0, 'message': f'Cached token error: {str(e)[:30]}'})}\n\n"
 
-        scraper = get_scraper()  # Reuse scraper across attempts
         while True:
             # Check timeout
             if time.time() - start_time > SSE_MAX_DURATION:
@@ -981,6 +980,7 @@ def download_info_stream(pkg):
 
             try:
                 # Get a fresh token from dispenser with arch-specific config
+                scraper = cloudscraper.create_scraper()  # Fresh scraper each attempt
                 response = scraper.post(
                     DISPENSER_URL,
                     headers={
