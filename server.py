@@ -15,7 +15,15 @@ import re
 import logging
 import threading
 import time as time_module
+import random
 from flask import Flask, request, jsonify, send_file, Response
+
+# Use gevent for parallel downloads (compatible with gunicorn gevent workers)
+try:
+    from gevent.pool import Pool as GeventPool
+    HAS_GEVENT = True
+except ImportError:
+    HAS_GEVENT = False
 from flask_cors import CORS
 import requests
 import cloudscraper
@@ -677,6 +685,7 @@ def auth_stream():
             return
 
         attempt = 0
+        scraper = get_scraper()  # Reuse scraper across attempts
         while True:
             # Check timeout
             if time.time() - start_time > SSE_MAX_DURATION:
@@ -689,7 +698,6 @@ def auth_stream():
             yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Trying token #{attempt}...'})}\n\n"
 
             try:
-                scraper = cloudscraper.create_scraper()
                 response = scraper.post(
                     DISPENSER_URL,
                     headers={
@@ -697,13 +705,13 @@ def auth_stream():
                         'Content-Type': 'application/json',
                     },
                     json=DEFAULT_DEVICE,
-                    timeout=30
+                    timeout=(5, 30)
                 )
 
                 if not response.ok:
                     logger.warning(f"Dispenser returned {response.status_code}, attempt {attempt}")
                     yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Token #{attempt} - dispenser error ({response.status_code})'})}\n\n"
-                    time.sleep(1)  # Brief delay before retry
+                    time.sleep(get_backoff_delay(attempt))
                     continue
 
                 auth_data = response.json()
@@ -721,19 +729,20 @@ def auth_stream():
                 else:
                     logger.warning(f"Token #{attempt} failed Chase validation")
                     yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Token #{attempt} - failed validation, retrying...'})}\n\n"
+                    time.sleep(get_backoff_delay(attempt, base=0.5))
 
             except requests.exceptions.ConnectionError as e:
                 logger.warning(f"Connection error on auth attempt {attempt}: {e}")
                 yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Token #{attempt} - retrying connection...'})}\n\n"
-                time.sleep(2)  # Longer wait for connection issues
+                time.sleep(get_backoff_delay(attempt, base=2.0))
             except requests.exceptions.Timeout as e:
                 logger.warning(f"Timeout on auth attempt {attempt}: {e}")
                 yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Token #{attempt} - request timeout, retrying...'})}\n\n"
-                time.sleep(1)
+                time.sleep(get_backoff_delay(attempt))
             except Exception as e:
                 logger.warning(f"Auth attempt {attempt} failed: {e}")
                 yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Token #{attempt} - error: {str(e)[:50]}'})}\n\n"
-                time.sleep(0.5)
+                time.sleep(get_backoff_delay(attempt, base=0.5))
 
     return Response(
         generate(),
@@ -758,10 +767,15 @@ def search():
     if not query:
         return jsonify({'error': 'Query required'}), 400
 
+    # Check cache first (1 hour TTL)
+    cached_results = get_cached_search(query.lower())
+    if cached_results is not None:
+        return jsonify({'results': cached_results, 'cached': True})
+
     try:
         response = get_scraper().get(
             f'https://play.google.com/store/search?q={query}&c=apps',
-            timeout=10
+            timeout=(5, 10)
         )
         html = response.text
 
@@ -842,7 +856,10 @@ def search():
                         'icon': icon
                     })
 
-        return jsonify({'results': results[:5]})
+        final_results = results[:5]
+        # Cache the results for future requests
+        cache_search(query.lower(), final_results)
+        return jsonify({'results': final_results})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -850,10 +867,9 @@ def search():
 @app.route('/api/info/<path:pkg>')
 def info(pkg):
     try:
-        scraper = cloudscraper.create_scraper()
-        response = scraper.get(
+        response = get_scraper().get(
             f'https://play.google.com/store/apps/details?id={pkg}&hl=en',
-            timeout=30
+            timeout=(5, 30)
         )
 
         if response.status_code == 404:
@@ -950,6 +966,7 @@ def download_info_stream(pkg):
             except Exception as e:
                 yield f"data: {json.dumps({'type': 'progress', 'attempt': 0, 'message': f'Cached token error: {str(e)[:30]}'})}\n\n"
 
+        scraper = get_scraper()  # Reuse scraper across attempts
         while True:
             # Check timeout
             if time.time() - start_time > SSE_MAX_DURATION:
@@ -962,7 +979,6 @@ def download_info_stream(pkg):
 
             try:
                 # Get a fresh token from dispenser with arch-specific config
-                scraper = cloudscraper.create_scraper()
                 response = scraper.post(
                     DISPENSER_URL,
                     headers={
@@ -970,13 +986,13 @@ def download_info_stream(pkg):
                         'Content-Type': 'application/json',
                     },
                     json=device_config,
-                    timeout=30
+                    timeout=(5, 30)
                 )
 
                 if not response.ok:
                     logger.warning(f"Dispenser returned {response.status_code}, attempt {attempt}")
                     yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Token #{attempt} - dispenser error ({response.status_code})'})}\n\n"
-                    time.sleep(1)
+                    time.sleep(get_backoff_delay(attempt))
                     continue
 
                 auth_data = response.json()
@@ -990,7 +1006,7 @@ def download_info_stream(pkg):
                     error_msg = info['error'][:50]
                     logger.warning(f"Token #{attempt} failed for {pkg}: {info['error']}")
                     yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Token #{attempt} - {error_msg}'})}\n\n"
-                    time.sleep(0.5)
+                    time.sleep(get_backoff_delay(attempt, base=0.5))
                     continue
 
                 # Success! Save the working token for this arch and return info
@@ -1019,15 +1035,15 @@ def download_info_stream(pkg):
             except requests.exceptions.ConnectionError as e:
                 logger.warning(f"Connection error on attempt {attempt}: {e}")
                 yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Token #{attempt} - retrying connection...'})}\n\n"
-                time.sleep(2)  # Longer wait for connection issues
+                time.sleep(get_backoff_delay(attempt, base=2.0))
             except requests.exceptions.Timeout as e:
                 logger.warning(f"Timeout on attempt {attempt}: {e}")
                 yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Token #{attempt} - request timeout, retrying...'})}\n\n"
-                time.sleep(1)
+                time.sleep(get_backoff_delay(attempt))
             except Exception as e:
                 logger.warning(f"Download info attempt {attempt} failed: {e}")
                 yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Token #{attempt} - error: {str(e)[:50]}'})}\n\n"
-                time.sleep(0.5)
+                time.sleep(get_backoff_delay(attempt, base=0.5))
 
     return Response(
         generate(),
@@ -1108,6 +1124,101 @@ merge_semaphore = threading.Semaphore(MAX_CONCURRENT_MERGES)
 # SSE timeout protection (prevents infinite connection holding)
 SSE_MAX_DURATION = 300  # 5 minutes max for any SSE stream
 
+# Search cache (reduces latency for repeated queries)
+SEARCH_CACHE = {}  # {query: (results, timestamp)}
+SEARCH_CACHE_TTL = 3600  # 1 hour
+SEARCH_CACHE_LOCK = threading.Lock()
+
+
+def get_cached_search(query):
+    """Get cached search results if still valid."""
+    with SEARCH_CACHE_LOCK:
+        if query in SEARCH_CACHE:
+            results, ts = SEARCH_CACHE[query]
+            if time_module.time() - ts < SEARCH_CACHE_TTL:
+                return results
+            del SEARCH_CACHE[query]
+    return None
+
+
+def cache_search(query, results):
+    """Cache search results with TTL."""
+    with SEARCH_CACHE_LOCK:
+        # Limit cache size to prevent memory bloat
+        if len(SEARCH_CACHE) > 1000:
+            # Remove oldest 100 entries
+            oldest = sorted(SEARCH_CACHE.items(), key=lambda x: x[1][1])[:100]
+            for k, _ in oldest:
+                del SEARCH_CACHE[k]
+        SEARCH_CACHE[query] = (results, time_module.time())
+
+
+def get_backoff_delay(attempt, base=1.0, max_delay=30.0):
+    """Exponential backoff with jitter to prevent thundering herd."""
+    delay = min(base * (2 ** min(attempt, 5)), max_delay)  # Cap exponent at 5
+    jitter = delay * 0.2 * random.random()
+    return delay + jitter
+
+
+def download_splits_parallel(splits, headers, max_workers=4):
+    """Download multiple splits in parallel for faster downloads.
+
+    Uses gevent Pool when available (compatible with gunicorn gevent workers),
+    falls back to sequential downloads otherwise.
+    """
+    if not splits:
+        return []
+
+    results = {}
+    errors = []
+
+    def download_one(split):
+        try:
+            resp = requests.get(split['downloadUrl'], headers=headers, timeout=(10, 120))
+            resp.raise_for_status()
+            content = resp.content
+            if 'content-length' in resp.headers:
+                expected = int(resp.headers['content-length'])
+                if len(content) != expected:
+                    raise ValueError(f"Size mismatch for {split['name']}: got {len(content)}, expected {expected}")
+            return split['name'], content, None
+        except Exception as e:
+            return split['name'], None, str(e)
+
+    if HAS_GEVENT:
+        # Use gevent pool (greenlet-based, compatible with gevent workers)
+        pool = GeventPool(size=min(max_workers, len(splits)))
+        results_list = pool.map(download_one, splits)
+        for name, content, error in results_list:
+            if error:
+                errors.append(f"{name}: {error}")
+            else:
+                results[name] = content
+    else:
+        # Fallback to sequential downloads
+        for split in splits:
+            name, content, error = download_one(split)
+            if error:
+                errors.append(f"{name}: {error}")
+            else:
+                results[name] = content
+
+    if errors:
+        raise ValueError(f"Failed to download splits: {'; '.join(errors)}")
+
+    return [(s['name'], results[s['name']]) for s in splits]
+
+
+def validate_download(response, name="file"):
+    """Validate downloaded content matches Content-Length header."""
+    content = response.content
+    if 'content-length' in response.headers:
+        expected = int(response.headers['content-length'])
+        actual = len(content)
+        if actual != expected:
+            raise ValueError(f"Download size mismatch for {name}: got {actual}, expected {expected}")
+    return content
+
 
 def cleanup_temp_apks():
     """Background cleanup of expired temp APKs."""
@@ -1151,6 +1262,7 @@ def save_temp_apk(apk_bytes, filename):
     """Save APK to disk and return file_id."""
     file_id = str(uuid.uuid4())
     file_path = TEMP_APK_DIR / f"{file_id}.apk"
+    meta_path = TEMP_APK_DIR / f"{file_id}.meta"
 
     # Check storage limit
     with TEMP_APK_LOCK:
@@ -1158,9 +1270,13 @@ def save_temp_apk(apk_bytes, filename):
         if total_size + len(apk_bytes) > MAX_TEMP_STORAGE_MB * 1024 * 1024:
             raise MemoryError("Temp storage limit exceeded, try again later")
 
-    # Write to disk
+    # Write APK to disk
     with open(file_path, 'wb') as f:
         f.write(apk_bytes)
+
+    # Write metadata file (for cross-worker access)
+    with open(meta_path, 'w') as f:
+        f.write(filename)
 
     with TEMP_APK_LOCK:
         TEMP_APK_REGISTRY[file_id] = {
@@ -1193,9 +1309,34 @@ def get_temp_apk(file_id):
 
 
 def consume_temp_apk(file_id):
-    """Get and remove temp APK from registry (one-time download)."""
+    """Get and remove temp APK from registry (one-time download).
+
+    With multiple gunicorn workers, the registry may not have the entry
+    if a different worker saved the file. Fall back to disk check.
+    """
     with TEMP_APK_LOCK:
         meta = TEMP_APK_REGISTRY.pop(file_id, None)
+
+    # If not in registry (different worker saved it), check disk directly
+    if not meta:
+        file_path = TEMP_APK_DIR / f"{file_id}.apk"
+        meta_path = TEMP_APK_DIR / f"{file_id}.meta"
+        if file_path.exists():
+            # Try to read original filename from metadata file
+            filename = f"{file_id}.apk"
+            if meta_path.exists():
+                try:
+                    filename = meta_path.read_text().strip()
+                    meta_path.unlink()  # Clean up meta file
+                except:
+                    pass
+            meta = {
+                'path': file_path,
+                'filename': filename,
+                'created': file_path.stat().st_mtime,
+                'size': file_path.stat().st_size
+            }
+
     return meta
 
 
@@ -1243,10 +1384,10 @@ def download_merged_stream(pkg):
                     pass
 
             if not auth_data:
+                scraper = get_scraper()  # Reuse scraper across attempts
                 for attempt in range(50):
                     yield f"data: {json.dumps({'type': 'progress', 'step': 'auth', 'message': f'Trying token #{attempt+1}...'})}\n\n"
                     try:
-                        scraper = cloudscraper.create_scraper()
                         response = scraper.post(
                             DISPENSER_URL,
                             headers={
@@ -1254,11 +1395,11 @@ def download_merged_stream(pkg):
                                 'Content-Type': 'application/json',
                             },
                             json=device_config,
-                            timeout=30
+                            timeout=(5, 30)
                         )
 
                         if not response.ok:
-                            time.sleep(1)
+                            time.sleep(get_backoff_delay(attempt))
                             continue
 
                         auth_data = response.json()
@@ -1269,10 +1410,14 @@ def download_merged_stream(pkg):
                             break
                         else:
                             auth_data = None
-                            time.sleep(0.5)
+                            time.sleep(get_backoff_delay(attempt, base=0.5))
 
+                    except requests.exceptions.ConnectionError as e:
+                        time.sleep(get_backoff_delay(attempt, base=2.0))
+                    except requests.exceptions.Timeout as e:
+                        time.sleep(get_backoff_delay(attempt))
                     except Exception as e:
-                        time.sleep(0.5)
+                        time.sleep(get_backoff_delay(attempt, base=0.5))
 
             if not info or 'error' in info:
                 yield f"data: {json.dumps({'type': 'error', 'message': 'Failed to get download info'})}\n\n"
@@ -1287,11 +1432,11 @@ def download_merged_stream(pkg):
             headers = {'Cookie': cookie_header} if cookie_header else {}
 
             try:
-                base_resp = requests.get(info['downloadUrl'], headers=headers, timeout=120)
+                base_resp = requests.get(info['downloadUrl'], headers=headers, timeout=(10, 120))
                 if not base_resp.ok:
                     yield f"data: {json.dumps({'type': 'error', 'message': 'Failed to download base APK'})}\n\n"
                     return
-                base_apk = base_resp.content
+                base_apk = validate_download(base_resp, "base APK")
 
                 # If no splits, return original APK without merging/signing
                 if not splits:
@@ -1302,16 +1447,13 @@ def download_merged_stream(pkg):
                         yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
                     return
 
-                # Download splits
-                splits_data = []
-                for i, split in enumerate(splits):
-                    split_name = split['name']
-                    yield f"data: {json.dumps({'type': 'progress', 'step': 'download', 'message': f'Downloading {split_name} ({i+2}/{total_files})...', 'current': i+2, 'total': total_files})}\n\n"
-                    split_resp = requests.get(split['downloadUrl'], headers=headers, timeout=120)
-                    if not split_resp.ok:
-                        yield f"data: {json.dumps({'type': 'error', 'message': f'Failed to download {split_name}'})}\n\n"
-                        return
-                    splits_data.append((split_name, split_resp.content))
+                # Download splits in parallel for faster downloads
+                yield f"data: {json.dumps({'type': 'progress', 'step': 'download', 'message': f'Downloading {len(splits)} splits in parallel...', 'current': 2, 'total': total_files})}\n\n"
+                try:
+                    splits_data = download_splits_parallel(splits, headers)
+                except Exception as e:
+                    yield f"data: {json.dumps({'type': 'error', 'message': f'Failed to download splits: {str(e)}'})}\n\n"
+                    return
 
                 # Acquire merge slot (limited to prevent CPU exhaustion)
                 if not merge_semaphore.acquire(timeout=DOWNLOAD_QUEUE_TIMEOUT):
@@ -1411,11 +1553,11 @@ def download_merged(pkg):
         except:
             pass
 
-    # If cached didn't work, try new tokens
+    # If cached didn't work, try new tokens with exponential backoff
     if not auth_data:
-        for attempt in range(100):  # Limit attempts for non-streaming endpoint
+        scraper = get_scraper()  # Reuse scraper across attempts
+        for attempt in range(100):
             try:
-                scraper = cloudscraper.create_scraper()
                 response = scraper.post(
                     DISPENSER_URL,
                     headers={
@@ -1423,11 +1565,11 @@ def download_merged(pkg):
                         'Content-Type': 'application/json',
                     },
                     json=device_config,
-                    timeout=30
+                    timeout=(5, 30)
                 )
 
                 if not response.ok:
-                    time.sleep(1)
+                    time.sleep(get_backoff_delay(attempt))
                     continue
 
                 auth_data = response.json()
@@ -1438,11 +1580,17 @@ def download_merged(pkg):
                     break
                 else:
                     auth_data = None
-                    time.sleep(0.5)
+                    time.sleep(get_backoff_delay(attempt, base=0.5))
 
+            except requests.exceptions.ConnectionError as e:
+                logger.warning(f"Connection error on attempt {attempt}: {e}")
+                time.sleep(get_backoff_delay(attempt, base=2.0))
+            except requests.exceptions.Timeout as e:
+                logger.warning(f"Timeout on attempt {attempt}: {e}")
+                time.sleep(get_backoff_delay(attempt))
             except Exception as e:
                 logger.warning(f"Merge download attempt {attempt} failed: {e}")
-                time.sleep(0.5)
+                time.sleep(get_backoff_delay(attempt, base=0.5))
 
     if not info or 'error' in info:
         return jsonify({'error': 'Failed to get download info after multiple attempts'}), 500
@@ -1452,12 +1600,12 @@ def download_merged(pkg):
     headers = {'Cookie': cookie_header} if cookie_header else {}
 
     try:
-        # Download base APK
+        # Download base APK with validation
         logger.info(f"Downloading base APK for {pkg}")
-        base_resp = requests.get(info['downloadUrl'], headers=headers, timeout=120)
+        base_resp = requests.get(info['downloadUrl'], headers=headers, timeout=(10, 120))
         if not base_resp.ok:
             return jsonify({'error': f'Failed to download base APK: {base_resp.status_code}'}), 500
-        base_apk = base_resp.content
+        base_apk = validate_download(base_resp, "base APK")
 
         # If no splits, just return base APK
         if not info['splits']:
@@ -1467,22 +1615,24 @@ def download_merged(pkg):
                 headers={'Content-Disposition': f'attachment; filename="{info["filename"]}"'}
             )
 
-        # Download all splits
-        splits_data = []
-        for split in info['splits']:
-            logger.info(f"Downloading split: {split['name']}")
-            split_resp = requests.get(split['downloadUrl'], headers=headers, timeout=120)
-            if not split_resp.ok:
-                return jsonify({'error': f'Failed to download split {split["name"]}: {split_resp.status_code}'}), 500
-            splits_data.append((split['name'], split_resp.content))
+        # Download all splits in parallel
+        logger.info(f"Downloading {len(info['splits'])} splits in parallel")
+        splits_data = download_splits_parallel(info['splits'], headers)
 
-        # Merge APKs
-        logger.info(f"Merging {len(splits_data) + 1} APKs")
-        merged_apk = merge_apks(base_apk, splits_data)
+        # Acquire merge semaphore to limit concurrent merges
+        if not merge_semaphore.acquire(timeout=DOWNLOAD_QUEUE_TIMEOUT):
+            return jsonify({'error': 'Server busy, please try again'}), 503
 
-        # Sign the merged APK
-        logger.info("Signing merged APK")
-        signed_apk = sign_apk(merged_apk)
+        try:
+            # Merge APKs
+            logger.info(f"Merging {len(splits_data) + 1} APKs")
+            merged_apk = merge_apks(base_apk, splits_data)
+
+            # Sign the merged APK
+            logger.info("Signing merged APK")
+            signed_apk = sign_apk(merged_apk)
+        finally:
+            merge_semaphore.release()
 
         merged_filename = f"{pkg}-{info['versionCode']}-merged.apk"
         return Response(
