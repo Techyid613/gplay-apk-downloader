@@ -13,13 +13,26 @@ import json
 import base64
 import re
 import logging
+import threading
+import time as time_module
 from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
 import requests
 import cloudscraper
 
-# Reusable scraper instance (faster than creating new one each time)
-SCRAPER = cloudscraper.create_scraper()
+# Thread-local scraper instances (thread-safe for concurrent requests)
+_scraper_local = threading.local()
+
+
+def get_scraper():
+    """Get a thread-local cloudscraper instance."""
+    if not hasattr(_scraper_local, 'scraper'):
+        _scraper_local.scraper = cloudscraper.create_scraper()
+    return _scraper_local.scraper
+
+
+# Legacy compatibility (in case anything still references this directly)
+SCRAPER = None  # Use get_scraper() instead
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -44,11 +57,29 @@ DETAILS_URL = f'{FDFE_URL}/details'
 
 # Server-side auth cache files (per architecture)
 from pathlib import Path
+from contextlib import contextmanager
+import fcntl
+
 AUTH_CACHE_DIR = Path.home()
 AUTH_CACHE_FILES = {
     'arm64-v8a': AUTH_CACHE_DIR / '.gplay-auth.json',  # Default for backward compat
     'armeabi-v7a': AUTH_CACHE_DIR / '.gplay-auth-armv7.json',
 }
+
+
+@contextmanager
+def file_lock(file_path, exclusive=True):
+    """Context manager for file locking (prevents race conditions)."""
+    lock_path = Path(str(file_path) + '.lock')
+    lock_fd = None
+    try:
+        lock_fd = open(lock_path, 'w')
+        fcntl.flock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+    finally:
+        if lock_fd:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
 
 # Device profile for ARM64 (modern 64-bit phones)
 DEVICE_ARM64 = {
@@ -336,29 +367,44 @@ def format_size(bytes_size):
 
 
 def get_cached_auth(arch='arm64-v8a'):
-    """Load cached auth from server-side auth file for specific architecture."""
+    """Load cached auth from server-side auth file for specific architecture (thread-safe)."""
     cache_file = AUTH_CACHE_FILES.get(arch, AUTH_CACHE_FILES['arm64-v8a'])
-    if cache_file.exists():
-        try:
+    if not cache_file.exists():
+        return None
+
+    try:
+        with file_lock(cache_file, exclusive=False):  # Shared lock for reads
             with open(cache_file) as f:
                 auth = json.load(f)
-            if auth.get('authToken') and auth.get('gsfId'):
-                logger.info(f"Using cached auth token for {arch}")
-                return auth
-        except Exception as e:
-            logger.warning(f"Failed to load cached auth for {arch}: {e}")
+        if auth.get('authToken') and auth.get('gsfId'):
+            logger.info(f"Using cached auth token for {arch}")
+            return auth
+    except Exception as e:
+        logger.warning(f"Failed to load cached auth for {arch}: {e}")
     return None
 
 
 def save_cached_auth(auth_data, arch='arm64-v8a'):
-    """Save auth data to server-side cache file for specific architecture."""
+    """Save auth data to server-side cache file for specific architecture (thread-safe, atomic)."""
     cache_file = AUTH_CACHE_FILES.get(arch, AUTH_CACHE_FILES['arm64-v8a'])
+    tmp_file = cache_file.with_suffix('.tmp')
+
     try:
-        cache_file.write_text(json.dumps(auth_data, indent=2))
+        with file_lock(cache_file, exclusive=True):  # Exclusive lock for writes
+            # Write to temp file first (atomic write pattern)
+            tmp_file.write_text(json.dumps(auth_data, indent=2))
+            # Atomic rename
+            tmp_file.replace(cache_file)
         logger.info(f"Auth saved to: {cache_file}")
         return True
     except Exception as e:
         logger.error(f"Failed to save auth: {e}")
+        # Clean up temp file if it exists
+        if tmp_file.exists():
+            try:
+                tmp_file.unlink()
+            except:
+                pass
         return False
 
 
@@ -553,6 +599,52 @@ def index():
     return send_file('index.html')
 
 
+@app.route('/health')
+def health_check():
+    """Health check endpoint for monitoring and load balancers."""
+    import psutil
+
+    try:
+        # Check disk space for temp storage
+        disk = psutil.disk_usage(str(TEMP_APK_DIR))
+        disk_ok = disk.percent < 90
+
+        # Check memory
+        mem = psutil.virtual_memory()
+        mem_ok = mem.percent < 90
+
+        # Count active temp files
+        with TEMP_APK_LOCK:
+            temp_count = len(TEMP_APK_REGISTRY)
+            temp_size = sum(m.get('size', 0) for m in TEMP_APK_REGISTRY.values())
+
+        # Get semaphore availability
+        download_slots = download_semaphore._value
+        merge_slots = merge_semaphore._value
+
+        status = {
+            'status': 'healthy' if (disk_ok and mem_ok) else 'degraded',
+            'gpapi_available': HAS_GPAPI,
+            'temp_files': temp_count,
+            'temp_size_mb': round(temp_size / 1024 / 1024, 2),
+            'disk_percent': disk.percent,
+            'memory_percent': mem.percent,
+            'download_slots_available': download_slots,
+            'download_slots_max': MAX_CONCURRENT_DOWNLOADS,
+            'merge_slots_available': merge_slots,
+            'merge_slots_max': MAX_CONCURRENT_MERGES,
+        }
+
+        code = 200 if status['status'] == 'healthy' else 503
+        return jsonify(status), code
+
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+
 @app.route('/api/auth', methods=['POST'])
 def auth():
     # First check if we have a valid cached token - use strict validation (Chase test)
@@ -572,9 +664,10 @@ def auth():
 
 @app.route('/api/auth/stream', methods=['GET'])
 def auth_stream():
-    """SSE endpoint that tries unlimited tokens and streams progress to the frontend."""
+    """SSE endpoint that tries tokens with timeout protection."""
     def generate():
         import time
+        start_time = time.time()
 
         # First check if we have a valid cached token
         cached = get_cached_auth()
@@ -585,6 +678,11 @@ def auth_stream():
 
         attempt = 0
         while True:
+            # Check timeout
+            if time.time() - start_time > SSE_MAX_DURATION:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Timeout - please try again'})}\n\n"
+                return
+
             attempt += 1
 
             # Send progress update
@@ -624,11 +722,18 @@ def auth_stream():
                     logger.warning(f"Token #{attempt} failed Chase validation")
                     yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Token #{attempt} - failed validation, retrying...'})}\n\n"
 
+            except requests.exceptions.ConnectionError as e:
+                logger.warning(f"Connection error on auth attempt {attempt}: {e}")
+                yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Token #{attempt} - retrying connection...'})}\n\n"
+                time.sleep(2)  # Longer wait for connection issues
+            except requests.exceptions.Timeout as e:
+                logger.warning(f"Timeout on auth attempt {attempt}: {e}")
+                yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Token #{attempt} - request timeout, retrying...'})}\n\n"
+                time.sleep(1)
             except Exception as e:
                 logger.warning(f"Auth attempt {attempt} failed: {e}")
                 yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Token #{attempt} - error: {str(e)[:50]}'})}\n\n"
-
-            time.sleep(0.5)  # Brief delay between attempts
+                time.sleep(0.5)
 
     return Response(
         generate(),
@@ -654,7 +759,7 @@ def search():
         return jsonify({'error': 'Query required'}), 400
 
     try:
-        response = SCRAPER.get(
+        response = get_scraper().get(
             f'https://play.google.com/store/search?q={query}&c=apps',
             timeout=10
         )
@@ -801,7 +906,7 @@ def download_info(pkg):
 
 @app.route('/api/download-info-stream/<path:pkg>')
 def download_info_stream(pkg):
-    """SSE endpoint that tries unlimited tokens until download URL is obtained."""
+    """SSE endpoint that tries tokens until download URL is obtained (with timeout protection)."""
     import time
 
     # Get architecture from query parameter
@@ -811,6 +916,7 @@ def download_info_stream(pkg):
     device_config = get_device_config(arch)
 
     def generate():
+        start_time = time.time()
         attempt = 0
 
         # Try cached token for this architecture
@@ -845,6 +951,11 @@ def download_info_stream(pkg):
                 yield f"data: {json.dumps({'type': 'progress', 'attempt': 0, 'message': f'Cached token error: {str(e)[:30]}'})}\n\n"
 
         while True:
+            # Check timeout
+            if time.time() - start_time > SSE_MAX_DURATION:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Timeout - please try again'})}\n\n"
+                return
+
             attempt += 1
 
             yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Trying token #{attempt}...'})}\n\n"
@@ -905,11 +1016,18 @@ def download_info_stream(pkg):
                 yield f"data: {json.dumps(result)}\n\n"
                 return
 
+            except requests.exceptions.ConnectionError as e:
+                logger.warning(f"Connection error on attempt {attempt}: {e}")
+                yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Token #{attempt} - retrying connection...'})}\n\n"
+                time.sleep(2)  # Longer wait for connection issues
+            except requests.exceptions.Timeout as e:
+                logger.warning(f"Timeout on attempt {attempt}: {e}")
+                yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Token #{attempt} - request timeout, retrying...'})}\n\n"
+                time.sleep(1)
             except Exception as e:
                 logger.warning(f"Download info attempt {attempt} failed: {e}")
                 yield f"data: {json.dumps({'type': 'progress', 'attempt': attempt, 'message': f'Token #{attempt} - error: {str(e)[:50]}'})}\n\n"
-
-            time.sleep(0.5)
+                time.sleep(0.5)
 
     return Response(
         generate(),
@@ -965,7 +1083,129 @@ def download(pkg, split_index=None):
 import tempfile
 import uuid
 
-# Store temp merged APKs
+# =============================================================================
+# Disk-Based Temporary APK Storage (Production-Ready)
+# =============================================================================
+
+# Configuration
+TEMP_APK_DIR = Path(tempfile.gettempdir()) / 'gplay_apks'
+TEMP_APK_TTL = 600  # 10 minutes
+MAX_TEMP_STORAGE_MB = 2048  # 2GB max temp storage
+TEMP_APK_DIR.mkdir(exist_ok=True)
+
+# Registry for temp files (lightweight - just metadata, not file content)
+TEMP_APK_REGISTRY = {}  # {file_id: {'path': Path, 'filename': str, 'created': float, 'size': int}}
+TEMP_APK_LOCK = threading.Lock()
+
+# Concurrency limits (prevents resource exhaustion under high load)
+MAX_CONCURRENT_DOWNLOADS = 10
+MAX_CONCURRENT_MERGES = 3
+DOWNLOAD_QUEUE_TIMEOUT = 30  # seconds to wait for a slot
+
+download_semaphore = threading.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+merge_semaphore = threading.Semaphore(MAX_CONCURRENT_MERGES)
+
+# SSE timeout protection (prevents infinite connection holding)
+SSE_MAX_DURATION = 300  # 5 minutes max for any SSE stream
+
+
+def cleanup_temp_apks():
+    """Background cleanup of expired temp APKs."""
+    while True:
+        try:
+            now = time_module.time()
+            expired = []
+
+            with TEMP_APK_LOCK:
+                for file_id, meta in list(TEMP_APK_REGISTRY.items()):
+                    if now - meta['created'] > TEMP_APK_TTL:
+                        expired.append(file_id)
+
+                # Remove expired entries
+                for file_id in expired:
+                    meta = TEMP_APK_REGISTRY.pop(file_id, None)
+                    if meta and meta['path'].exists():
+                        try:
+                            meta['path'].unlink()
+                            logger.info(f"Cleaned up expired temp APK: {file_id}")
+                        except Exception as e:
+                            logger.warning(f"Failed to clean temp file: {e}")
+
+            # Also clean orphaned files not in registry
+            if TEMP_APK_DIR.exists():
+                for f in TEMP_APK_DIR.iterdir():
+                    if f.is_file() and f.stat().st_mtime < now - TEMP_APK_TTL:
+                        try:
+                            f.unlink()
+                            logger.debug(f"Cleaned orphaned temp file: {f.name}")
+                        except:
+                            pass
+
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+
+        time_module.sleep(60)  # Run every minute
+
+
+def save_temp_apk(apk_bytes, filename):
+    """Save APK to disk and return file_id."""
+    file_id = str(uuid.uuid4())
+    file_path = TEMP_APK_DIR / f"{file_id}.apk"
+
+    # Check storage limit
+    with TEMP_APK_LOCK:
+        total_size = sum(m.get('size', 0) for m in TEMP_APK_REGISTRY.values())
+        if total_size + len(apk_bytes) > MAX_TEMP_STORAGE_MB * 1024 * 1024:
+            raise MemoryError("Temp storage limit exceeded, try again later")
+
+    # Write to disk
+    with open(file_path, 'wb') as f:
+        f.write(apk_bytes)
+
+    with TEMP_APK_LOCK:
+        TEMP_APK_REGISTRY[file_id] = {
+            'path': file_path,
+            'filename': filename,
+            'created': time_module.time(),
+            'size': len(apk_bytes)
+        }
+
+    logger.info(f"Saved temp APK: {file_id} ({len(apk_bytes)} bytes)")
+    return file_id
+
+
+def get_temp_apk(file_id):
+    """Get temp APK metadata, or None if not found/expired."""
+    with TEMP_APK_LOCK:
+        meta = TEMP_APK_REGISTRY.get(file_id)
+        if not meta:
+            return None
+        if time_module.time() - meta['created'] > TEMP_APK_TTL:
+            # Expired
+            TEMP_APK_REGISTRY.pop(file_id, None)
+            if meta['path'].exists():
+                try:
+                    meta['path'].unlink()
+                except:
+                    pass
+            return None
+        return meta.copy()
+
+
+def consume_temp_apk(file_id):
+    """Get and remove temp APK from registry (one-time download)."""
+    with TEMP_APK_LOCK:
+        meta = TEMP_APK_REGISTRY.pop(file_id, None)
+    return meta
+
+
+# Start cleanup thread (daemon so it dies when main process exits)
+_cleanup_thread = threading.Thread(target=cleanup_temp_apks, daemon=True)
+_cleanup_thread.start()
+logger.info(f"Temp APK storage initialized: {TEMP_APK_DIR}")
+
+
+# Legacy compatibility (in case anything still references this)
 TEMP_APKS = {}
 
 
@@ -980,113 +1220,126 @@ def download_merged_stream(pkg):
     device_config = get_device_config(arch)
 
     def generate():
-        # Try to get a working token
-        yield f"data: {json.dumps({'type': 'progress', 'step': 'auth', 'message': 'Getting auth token...'})}\n\n"
-
-        auth_data = None
-        info = None
-
-        # Try cached token for this architecture
-        cached = get_cached_auth(arch)
-        if cached:
-            try:
-                info = get_download_info(pkg, cached)
-                if 'error' not in info:
-                    auth_data = cached
-            except:
-                pass
-
-        if not auth_data:
-            for attempt in range(50):
-                yield f"data: {json.dumps({'type': 'progress', 'step': 'auth', 'message': f'Trying token #{attempt+1}...'})}\n\n"
-                try:
-                    scraper = cloudscraper.create_scraper()
-                    response = scraper.post(
-                        DISPENSER_URL,
-                        headers={
-                            'User-Agent': 'com.aurora.store-4.6.1-70',
-                            'Content-Type': 'application/json',
-                        },
-                        json=device_config,
-                        timeout=30
-                    )
-
-                    if not response.ok:
-                        time.sleep(1)
-                        continue
-
-                    auth_data = response.json()
-                    info = get_download_info(pkg, auth_data)
-
-                    if 'error' not in info:
-                        save_cached_auth(auth_data, arch)
-                        break
-                    else:
-                        auth_data = None
-                        time.sleep(0.5)
-
-                except Exception as e:
-                    time.sleep(0.5)
-
-        if not info or 'error' in info:
-            yield f"data: {json.dumps({'type': 'error', 'message': 'Failed to get download info'})}\n\n"
+        # Try to acquire a download slot (prevents resource exhaustion)
+        if not download_semaphore.acquire(timeout=DOWNLOAD_QUEUE_TIMEOUT):
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Server busy, please try again later'})}\n\n"
             return
 
-        splits = info.get('splits', [])
-        total_files = 1 + len(splits)
-
-        yield f"data: {json.dumps({'type': 'progress', 'step': 'download', 'message': f'Downloading APK...', 'current': 1, 'total': total_files})}\n\n"
-
-        cookie_header = '; '.join([f"{c['name']}={c['value']}" for c in info.get('cookies', [])])
-        headers = {'Cookie': cookie_header} if cookie_header else {}
-
         try:
-            base_resp = requests.get(info['downloadUrl'], headers=headers, timeout=120)
-            if not base_resp.ok:
-                yield f"data: {json.dumps({'type': 'error', 'message': 'Failed to download base APK'})}\n\n"
-                return
-            base_apk = base_resp.content
+            # Try to get a working token
+            yield f"data: {json.dumps({'type': 'progress', 'step': 'auth', 'message': 'Getting auth token...'})}\n\n"
 
-            # If no splits, return original APK without merging/signing
-            if not splits:
-                file_id = str(uuid.uuid4())
-                TEMP_APKS[file_id] = {
-                    'data': base_apk,
-                    'filename': info['filename'],
-                    'created': time.time()
-                }
-                yield f"data: {json.dumps({'type': 'success', 'download_id': file_id, 'filename': info['filename'], 'original': True})}\n\n"
+            auth_data = None
+            info = None
+
+            # Try cached token for this architecture
+            cached = get_cached_auth(arch)
+            if cached:
+                try:
+                    info = get_download_info(pkg, cached)
+                    if 'error' not in info:
+                        auth_data = cached
+                except:
+                    pass
+
+            if not auth_data:
+                for attempt in range(50):
+                    yield f"data: {json.dumps({'type': 'progress', 'step': 'auth', 'message': f'Trying token #{attempt+1}...'})}\n\n"
+                    try:
+                        scraper = cloudscraper.create_scraper()
+                        response = scraper.post(
+                            DISPENSER_URL,
+                            headers={
+                                'User-Agent': 'com.aurora.store-4.6.1-70',
+                                'Content-Type': 'application/json',
+                            },
+                            json=device_config,
+                            timeout=30
+                        )
+
+                        if not response.ok:
+                            time.sleep(1)
+                            continue
+
+                        auth_data = response.json()
+                        info = get_download_info(pkg, auth_data)
+
+                        if 'error' not in info:
+                            save_cached_auth(auth_data, arch)
+                            break
+                        else:
+                            auth_data = None
+                            time.sleep(0.5)
+
+                    except Exception as e:
+                        time.sleep(0.5)
+
+            if not info or 'error' in info:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Failed to get download info'})}\n\n"
                 return
 
-            # Download splits
-            splits_data = []
-            for i, split in enumerate(splits):
-                split_name = split['name']
-                yield f"data: {json.dumps({'type': 'progress', 'step': 'download', 'message': f'Downloading {split_name} ({i+2}/{total_files})...', 'current': i+2, 'total': total_files})}\n\n"
-                split_resp = requests.get(split['downloadUrl'], headers=headers, timeout=120)
-                if not split_resp.ok:
-                    yield f"data: {json.dumps({'type': 'error', 'message': f'Failed to download {split_name}'})}\n\n"
+            splits = info.get('splits', [])
+            total_files = 1 + len(splits)
+
+            yield f"data: {json.dumps({'type': 'progress', 'step': 'download', 'message': f'Downloading APK...', 'current': 1, 'total': total_files})}\n\n"
+
+            cookie_header = '; '.join([f"{c['name']}={c['value']}" for c in info.get('cookies', [])])
+            headers = {'Cookie': cookie_header} if cookie_header else {}
+
+            try:
+                base_resp = requests.get(info['downloadUrl'], headers=headers, timeout=120)
+                if not base_resp.ok:
+                    yield f"data: {json.dumps({'type': 'error', 'message': 'Failed to download base APK'})}\n\n"
                     return
-                splits_data.append((split_name, split_resp.content))
+                base_apk = base_resp.content
 
-            yield f"data: {json.dumps({'type': 'progress', 'step': 'merge', 'message': 'Merging APKs...'})}\n\n"
-            merged_apk = merge_apks(base_apk, splits_data)
+                # If no splits, return original APK without merging/signing
+                if not splits:
+                    try:
+                        file_id = save_temp_apk(base_apk, info['filename'])
+                        yield f"data: {json.dumps({'type': 'success', 'download_id': file_id, 'filename': info['filename'], 'original': True})}\n\n"
+                    except MemoryError as e:
+                        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+                    return
 
-            yield f"data: {json.dumps({'type': 'progress', 'step': 'sign', 'message': 'Signing APK...'})}\n\n"
-            signed_apk = sign_apk(merged_apk)
+                # Download splits
+                splits_data = []
+                for i, split in enumerate(splits):
+                    split_name = split['name']
+                    yield f"data: {json.dumps({'type': 'progress', 'step': 'download', 'message': f'Downloading {split_name} ({i+2}/{total_files})...', 'current': i+2, 'total': total_files})}\n\n"
+                    split_resp = requests.get(split['downloadUrl'], headers=headers, timeout=120)
+                    if not split_resp.ok:
+                        yield f"data: {json.dumps({'type': 'error', 'message': f'Failed to download {split_name}'})}\n\n"
+                        return
+                    splits_data.append((split_name, split_resp.content))
 
-            # Save to temp storage
-            file_id = str(uuid.uuid4())
-            TEMP_APKS[file_id] = {
-                'data': signed_apk,
-                'filename': f"{pkg}-{info['versionCode']}-merged.apk",
-                'created': time.time()
-            }
+                # Acquire merge slot (limited to prevent CPU exhaustion)
+                if not merge_semaphore.acquire(timeout=DOWNLOAD_QUEUE_TIMEOUT):
+                    yield f"data: {json.dumps({'type': 'error', 'message': 'Merge queue full, try again later'})}\n\n"
+                    return
 
-            yield f"data: {json.dumps({'type': 'success', 'download_id': file_id, 'filename': TEMP_APKS[file_id]['filename']})}\n\n"
+                try:
+                    yield f"data: {json.dumps({'type': 'progress', 'step': 'merge', 'message': 'Merging APKs...'})}\n\n"
+                    merged_apk = merge_apks(base_apk, splits_data)
 
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+                    yield f"data: {json.dumps({'type': 'progress', 'step': 'sign', 'message': 'Signing APK...'})}\n\n"
+                    signed_apk = sign_apk(merged_apk)
+
+                    # Save to disk-based temp storage
+                    merged_filename = f"{pkg}-{info['versionCode']}-merged.apk"
+                    try:
+                        file_id = save_temp_apk(signed_apk, merged_filename)
+                        yield f"data: {json.dumps({'type': 'success', 'download_id': file_id, 'filename': merged_filename})}\n\n"
+                    except MemoryError as e:
+                        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+                finally:
+                    merge_semaphore.release()
+
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+        finally:
+            download_semaphore.release()
 
     return Response(
         generate(),
@@ -1101,18 +1354,35 @@ def download_merged_stream(pkg):
 
 @app.route('/api/download-temp/<file_id>')
 def download_temp(file_id):
-    """Download a temporary merged APK."""
-    if file_id not in TEMP_APKS:
+    """Download a temporary merged APK (streams from disk)."""
+    meta = consume_temp_apk(file_id)
+    if not meta or not meta['path'].exists():
         return jsonify({'error': 'File not found or expired'}), 404
 
-    apk_data = TEMP_APKS[file_id]
-    # Clean up after download
-    del TEMP_APKS[file_id]
+    def generate_and_cleanup():
+        """Stream file from disk and clean up after."""
+        try:
+            with open(meta['path'], 'rb') as f:
+                while True:
+                    chunk = f.read(65536)  # 64KB chunks
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            # Clean up file after streaming
+            try:
+                meta['path'].unlink()
+                logger.debug(f"Cleaned up temp file after download: {file_id}")
+            except Exception as e:
+                logger.warning(f"Failed to clean temp file after download: {e}")
 
     return Response(
-        apk_data['data'],
+        generate_and_cleanup(),
         content_type='application/vnd.android.package-archive',
-        headers={'Content-Disposition': f'attachment; filename="{apk_data["filename"]}"'}
+        headers={
+            'Content-Disposition': f'attachment; filename="{meta["filename"]}"',
+            'Content-Length': str(meta['size'])
+        }
     )
 
 
@@ -1227,6 +1497,13 @@ def download_merged(pkg):
 
 
 if __name__ == '__main__':
+    import os
+    debug = os.environ.get('FLASK_DEBUG', 'false').lower() == 'true'
     print('Starting GPlay Downloader on http://localhost:5000')
     print(f'gpapi available: {HAS_GPAPI}')
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    print(f'Debug mode: {debug}')
+    if debug:
+        app.run(host='0.0.0.0', port=5000, debug=True)
+    else:
+        print('For production, use: gunicorn -c gunicorn.conf.py server:app')
+        app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

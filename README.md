@@ -52,15 +52,27 @@ The setup script will:
 ### Starting the Server
 
 ```bash
-./start-server.sh
+./start-server.sh           # Production mode (gunicorn + gevent)
+./start-server.sh dev       # Development mode (Flask debug server)
 ```
 
 The server runs in the background on port 5000. Open http://localhost:5000 in your browser.
+
+**Production mode** (default):
+- Gunicorn with gevent async workers (CPU cores × 2 + 1)
+- Handles 100+ concurrent users
+- Disk-based temp storage (2GB limit, 10min TTL)
+- Connection pooling and rate limiting
+
+**Development mode**:
+- Single-threaded Flask server with debug output
+- Auto-reload on code changes
 
 Features:
 - **Kill existing**: Automatically kills any existing server on port 5000
 - **Background**: Runs detached from terminal (survives terminal close)
 - **Logging**: Outputs to `server.log` (auto-rotated after 12 hours)
+- **Health check**: GET `/health` for monitoring
 
 ### Using the Web UI
 
@@ -184,6 +196,7 @@ The web server exposes these REST endpoints:
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/` | GET | Web UI |
+| `/health` | GET | Health check (returns system status) |
 | `/api/search?q=<query>` | GET | Search apps |
 | `/api/info/<package>` | GET | Get app details |
 | `/api/download-info-stream/<package>` | GET | SSE stream for download info |
@@ -269,6 +282,7 @@ This tool merges them back into a universal APK that works on any device.
 ```
 gplay-downloader/
 ├── server.py           # Flask web server
+├── gunicorn.conf.py    # Production server config
 ├── index.html          # Web UI
 ├── gplay-downloader.py # CLI tool
 ├── gplay               # CLI wrapper script
