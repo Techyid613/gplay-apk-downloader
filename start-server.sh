@@ -41,7 +41,7 @@ if [ -f server.log ]; then
 fi
 
 echo "Starting server in background on port $PORT..."
-nohup PORT="$PORT" python3 server.py > server.log 2>&1 &
+PORT="$PORT" nohup python3 server.py > server.log 2>&1 &
 disown
 echo "Server started (PID: $!)"
 echo "Logs: tail -f $SCRIPT_DIR/server.log"
